@@ -14,6 +14,7 @@ static const int c_batchSize = 16;
 #include <random>
 #include <vector>
 #include <direct.h>
+#include <stdio.h>
 
 using Vec3 = float[3];
 
@@ -24,19 +25,16 @@ struct ImageData
 	std::vector<float> pixels;
 };
 
-struct TargetImage
-{
-	const char* fileName = nullptr;
-	float weight = 0.0f;
-	ImageData image;
-	std::vector<float> sourceDelta;
-};
-
 struct Settings
 {
 	const char* srcImageFileName = nullptr;
 	ImageData srcimage;
-	std::vector<TargetImage> targetImages;
+
+	const char* targetImageFileName = nullptr;
+	ImageData targetImage;
+	float weight = 1.0f;
+
+	std::vector<float> sourceDelta;
 };
 
 std::mt19937 GetRNG()
@@ -75,16 +73,16 @@ bool SaveFloatImage(const ImageData& imageData, const char* fileName)
 	return stbi_write_png(fileName, imageData.width, imageData.height, 3, pixels.data(), 0) == 1;
 }
 
-void SlicedOptimalTransport(const ImageData& source, TargetImage& targetImage)
+void SlicedOptimalTransport(Settings& settings)
 {
-	printf("\n%s (weight %0.2f)\n\n", targetImage.fileName, targetImage.weight);
+	printf("\n%s (weight %0.2f)\n\n", settings.targetImageFileName, settings.weight);
 
-	const uint32_t c_numPixels = source.width * source.height;
+	const uint32_t c_numPixels = settings.srcimage.width * settings.srcimage.height;
 
 	std::mt19937 rng = GetRNG();
 	std::normal_distribution<float> normalDist(0.0f, 1.0f);
 
-	ImageData current = source;
+	ImageData current = settings.srcimage;
 
 	std::vector<uint32_t> currentSorted(c_numPixels);
 	std::vector<uint32_t> targetSorted(c_numPixels);
@@ -122,9 +120,9 @@ void SlicedOptimalTransport(const ImageData& source, TargetImage& targetImage)
 					direction[2] * current.pixels[i * 3 + 2];
 
 				targetProjections[i] =
-					direction[0] * targetImage.image.pixels[i * 3 + 0] +
-					direction[1] * targetImage.image.pixels[i * 3 + 1] +
-					direction[2] * targetImage.image.pixels[i * 3 + 2];
+					direction[0] * settings.targetImage.pixels[i * 3 + 0] +
+					direction[1] * settings.targetImage.pixels[i * 3 + 1] +
+					direction[2] * settings.targetImage.pixels[i * 3 + 2];
 			}
 
 			// sort
@@ -174,44 +172,41 @@ void SlicedOptimalTransport(const ImageData& source, TargetImage& targetImage)
 	}
 
 	// Calculate deltas
-	targetImage.sourceDelta.resize(c_numPixels * 3);
+	settings.sourceDelta.resize(c_numPixels * 3);
 	for (size_t i = 0; i < c_numPixels * 3; ++i)
-		targetImage.sourceDelta[i] = current.pixels[i] - source.pixels[i];
+		settings.sourceDelta[i] = current.pixels[i] - settings.srcimage.pixels[i];
 }
 
-void InterpolateColorHistogram(Settings& settings, const char* outputFileName)
+void InterpolateColorHistogram(Settings& settings, const char* outputFileNameBase)
 {
+	char outputFileName[1024];
+	sprintf_s(outputFileName, "%s.png", outputFileNameBase);
+
+	char outputFileNameCSV[1024];
+	sprintf_s(outputFileNameCSV, "%s.csv", outputFileNameBase);
+
 	printf("==================================\n%s\n==================================\n", outputFileName);
 
 	// load up the source image
 	LoadImageAsFloat(settings.srcImageFileName, settings.srcimage);
 
-	// do SOT on each target image
-	for (size_t index = 0; index < settings.targetImages.size(); ++index)
+	// load the target image and verify it's compatible
+	LoadImageAsFloat(settings.targetImageFileName, settings.targetImage);
+	if (settings.targetImage.width != settings.srcimage.width || settings.targetImage.height != settings.srcimage.height)
 	{
-		// load the target image and verify it's compatible
-		TargetImage& targetImage = settings.targetImages[index];
-		LoadImageAsFloat(targetImage.fileName, targetImage.image);
-		if (targetImage.image.width != settings.srcimage.width || targetImage.image.height != settings.srcimage.height)
-		{
-			printf("ERROR: image %s is %ix%i, but should be %ix%i like %s.\n",
-				targetImage.fileName, targetImage.image.width, targetImage.image.height,
-				settings.srcimage.width, settings.srcimage.height, settings.srcImageFileName);
-			return;
-		}
-
-		// do optimal transport to get the per pixel delta to get from the source image to the target image
-		SlicedOptimalTransport(settings.srcimage, settings.targetImages[index]);
+		printf("ERROR: image %s is %ix%i, but should be %ix%i like %s.\n",
+			settings.targetImageFileName, settings.targetImage.width, settings.targetImage.height,
+			settings.srcimage.width, settings.srcimage.height, settings.srcImageFileName);
+		return;
 	}
+
+	// do optimal transport to get the per pixel delta to get from the source image to the target image
+	SlicedOptimalTransport(settings);
 
 	// Do barycentric interpolation
 	ImageData output = settings.srcimage;
-	float baseWeight = 1.0f;
-	for (const TargetImage& targetImage : settings.targetImages)
-	{
-		for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
-			output.pixels[valueIndex] += targetImage.sourceDelta[valueIndex] * targetImage.weight;
-	}
+	for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
+		output.pixels[valueIndex] += settings.sourceDelta[valueIndex] * settings.weight;
 
 	// Save output image
 	SaveFloatImage(output, outputFileName);
@@ -229,8 +224,8 @@ int main(int argc, char** argv)
 	{
 		Settings settings;
 		settings.srcImageFileName = "images/florida.png";
-		settings.targetImages.push_back({"images/dunes.png", 1.0f});
-		InterpolateColorHistogram(settings, "out/florida-dunes.png");
+		settings.targetImageFileName = "images/dunes.png";
+		InterpolateColorHistogram(settings, "out/florida-dunes");
 
 		system("python MakeHistogram.py out/florida-dunes.png out/florida-dunes.histogram.png 12000");
 	}
@@ -238,8 +233,8 @@ int main(int argc, char** argv)
 	{
 		Settings settings;
 		settings.srcImageFileName = "images/florida.png";
-		settings.targetImages.push_back({ "images/turtle.png", 1.0f });
-		InterpolateColorHistogram(settings, "out/florida-turtle.png");
+		settings.targetImageFileName = "images/turtle.png";
+		InterpolateColorHistogram(settings, "out/florida-turtle");
 
 		system("python MakeHistogram.py out/florida-turtle.png out/florida-turtle.histogram.png 12000");
 	}
@@ -247,8 +242,8 @@ int main(int argc, char** argv)
 	{
 		Settings settings;
 		settings.srcImageFileName = "images/florida.png";
-		settings.targetImages.push_back({ "images/bigcat.png", 1.0f });
-		InterpolateColorHistogram(settings, "out/florida-bigcat.png");
+		settings.targetImageFileName = "images/bigcat.png";
+		InterpolateColorHistogram(settings, "out/florida-bigcat");
 
 		system("python MakeHistogram.py out/florida-bigcat.png out/florida-bigcat.histogram.png 12000");
 	}
@@ -259,8 +254,9 @@ int main(int argc, char** argv)
 /*
 TODO:
 * make a csv of total movement over time and graph it to see if it's enough steps
+* output how long it took. not super important
 * clean up code?
 * optimize code? omp?
 * make an interpolation example with 2 images
-* make an interpolation example with 3 images
+! mention in the post that you could do barycentric interpolation with multiple images. and could even go "outside of the simplex" with those coordinates to move away from histograms etc.
 */
