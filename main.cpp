@@ -310,14 +310,3 @@ int main(int argc, char** argv)
 
 	return 0;
 }
-
-/*
-TODO:
-! 300 lines of C++ code, and just stb for image reading and writing.
-! mention in the post that you could do barycentric interpolation with multiple images. and could even go "outside of the simplex" with those coordinates to move away from histograms etc.
-! mention that the sorting is the slowest part, per the profiler. same as the other post. could multithread it but :shrug:
-! say how long it took, and what resolution image
-! show graphs of csvs
-* mention how you can do all the batches in parallel
-* ! show example of 1d and 2d interpolation. both the images and the histograms
-*/
