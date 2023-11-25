@@ -34,13 +34,18 @@ struct Settings
 	ImageData targetImage;
 	float weight = 1.0f;
 
-	std::vector<float> sourceDelta;
+	std::vector<float> result;
 };
 
-std::mt19937 GetRNG()
+inline float Lerp(float A, float B, float t)
+{
+	return A * (1.0f - t) + B * t;
+}
+
+std::mt19937 GetRNG(int index)
 {
 	#if DETERMINISTIC()
-	std::mt19937 ret;
+	std::mt19937 ret(index);
 	#else
 	std::random_device rd;
 	std::mt19937 ret(rd());
@@ -75,34 +80,55 @@ bool SaveFloatImage(const ImageData& imageData, const char* fileName)
 
 void SlicedOptimalTransport(Settings& settings)
 {
-	printf("\n%s (weight %0.2f)\n\n", settings.targetImageFileName, settings.weight);
+	printf("\n%s\n\n", settings.targetImageFileName);
 
 	const uint32_t c_numPixels = settings.srcimage.width * settings.srcimage.height;
 
-	std::mt19937 rng = GetRNG();
-	std::normal_distribution<float> normalDist(0.0f, 1.0f);
+	std::vector<float>& current = settings.result;
+	current = settings.srcimage.pixels;
 
-	ImageData current = settings.srcimage;
-
-	std::vector<uint32_t> currentSorted(c_numPixels);
-	std::vector<uint32_t> targetSorted(c_numPixels);
-	for (uint32_t i = 0; i < c_numPixels; ++i)
+	// Per batch data
+	// Each batch has it's own data so the batches can be parallelized
+	struct BatchData
 	{
-		currentSorted[i] = i;
-		targetSorted[i] = i;
-	}
+		BatchData(uint32_t numPixels)
+		{
+			currentSorted.resize(numPixels);
+			targetSorted.resize(numPixels);
+			for (uint32_t i = 0; i < numPixels; ++i)
+			{
+				currentSorted[i] = i;
+				targetSorted[i] = i;
+			}
 
-	std::vector<float> currentProjections(c_numPixels);
-	std::vector<float> targetProjections(c_numPixels);
+			currentProjections.resize(numPixels);
+			targetProjections.resize(numPixels);
 
-	std::vector<float> batchDirections(c_numPixels * 3);
+			batchDirections.resize(numPixels * 3);
+		}
 
+		std::vector<uint32_t> currentSorted;
+		std::vector<uint32_t> targetSorted;
+
+		std::vector<float> currentProjections;
+		std::vector<float> targetProjections;
+
+		std::vector<float> batchDirections;
+	};
+	std::vector<BatchData> allBatchData(c_batchSize, BatchData(c_numPixels));
+
+	// For each iteration
 	for (int iteration = 0; iteration < c_numIterations; ++iteration)
 	{
-		std::fill(batchDirections.begin(), batchDirections.end(), 0.0f);
-
+		// Do the batches in parallel
+		#pragma omp parallel for
 		for (int batchIndex = 0; batchIndex < c_batchSize; ++batchIndex)
 		{
+			BatchData& batchData = allBatchData[batchIndex];
+
+			std::mt19937 rng = GetRNG(iteration * c_batchSize + batchIndex);
+			std::normal_distribution<float> normalDist(0.0f, 1.0f);
+
 			// Make a uniform random unit vector by generating 3 normal distributed values and normalizing the result.
 			Vec3 direction;
 			direction[0] = normalDist(rng);
@@ -116,40 +142,50 @@ void SlicedOptimalTransport(Settings& settings)
 			// project current and target
 			for (size_t i = 0; i < c_numPixels; ++i)
 			{
-				currentProjections[i] =
-					direction[0] * current.pixels[i * 3 + 0] +
-					direction[1] * current.pixels[i * 3 + 1] +
-					direction[2] * current.pixels[i * 3 + 2];
+				batchData.currentProjections[i] =
+					direction[0] * current[i * 3 + 0] +
+					direction[1] * current[i * 3 + 1] +
+					direction[2] * current[i * 3 + 2];
 
-				targetProjections[i] =
+				batchData.targetProjections[i] =
 					direction[0] * settings.targetImage.pixels[i * 3 + 0] +
 					direction[1] * settings.targetImage.pixels[i * 3 + 1] +
 					direction[2] * settings.targetImage.pixels[i * 3 + 2];
 			}
 
-			// sort
-			std::sort(currentSorted.begin(), currentSorted.end(),
+			// sort current and target
+			std::sort(batchData.currentSorted.begin(), batchData.currentSorted.end(),
 				[&] (uint32_t a, uint32_t b)
 				{
-					return currentProjections[a] < currentProjections[b];
+					return batchData.currentProjections[a] < batchData.currentProjections[b];
 				}
 			);
 
-			std::sort(targetSorted.begin(), targetSorted.end(),
+			std::sort(batchData.targetSorted.begin(), batchData.targetSorted.end(),
 				[&](uint32_t a, uint32_t b)
 				{
-					return targetProjections[a] < targetProjections[b];
+					return batchData.targetProjections[a] < batchData.targetProjections[b];
 				}
 			);
 
 			// update batchDirections
 			for (size_t i = 0; i < c_numPixels; ++i)
 			{
-				float projDiff = targetProjections[targetSorted[i]] - currentProjections[currentSorted[i]];
+				float projDiff = batchData.targetProjections[batchData.targetSorted[i]] - batchData.currentProjections[batchData.currentSorted[i]];
 
-				batchDirections[currentSorted[i] * 3 + 0] += direction[0] * projDiff;
-				batchDirections[currentSorted[i] * 3 + 1] += direction[1] * projDiff;
-				batchDirections[currentSorted[i] * 3 + 2] += direction[2] * projDiff;
+				batchData.batchDirections[batchData.currentSorted[i] * 3 + 0] = direction[0] * projDiff;
+				batchData.batchDirections[batchData.currentSorted[i] * 3 + 1] = direction[1] * projDiff;
+				batchData.batchDirections[batchData.currentSorted[i] * 3 + 2] = direction[2] * projDiff;
+			}
+		}
+
+		// average all batch directions into batchDirections[0]
+		{
+			for (int batchIndex = 1; batchIndex < c_batchSize; ++batchIndex)
+			{
+				float alpha = 1.0f / float(batchIndex + 1);
+				for (size_t i = 0; i < c_numPixels * 3; ++i)
+					allBatchData[0].batchDirections[i] = Lerp(allBatchData[0].batchDirections[i], allBatchData[batchIndex].batchDirections[i], alpha);
 			}
 		}
 
@@ -158,25 +194,20 @@ void SlicedOptimalTransport(Settings& settings)
 		for (size_t i = 0; i < c_numPixels; ++i)
 		{
 			float adjust[3] = {
-				batchDirections[i * 3 + 0] / float(c_batchSize),
-				batchDirections[i * 3 + 1] / float(c_batchSize),
-				batchDirections[i * 3 + 2] / float(c_batchSize)
+				allBatchData[0].batchDirections[i * 3 + 0],
+				allBatchData[0].batchDirections[i * 3 + 1],
+				allBatchData[0].batchDirections[i * 3 + 2]
 			};
 
-			current.pixels[i * 3 + 0] += adjust[0];
-			current.pixels[i * 3 + 1] += adjust[1];
-			current.pixels[i * 3 + 2] += adjust[2];
+			current[i * 3 + 0] += adjust[0];
+			current[i * 3 + 1] += adjust[1];
+			current[i * 3 + 2] += adjust[2];
 
 			totalDistance += std::sqrt(adjust[0] * adjust[0] + adjust[1] * adjust[1] + adjust[2] * adjust[2]);
 		}
 
-		printf("[%i] %f\n", iteration, totalDistance);
+		printf("[%i] %f\n", iteration, totalDistance / float(c_numPixels));
 	}
-
-	// Calculate deltas
-	settings.sourceDelta.resize(c_numPixels * 3);
-	for (size_t i = 0; i < c_numPixels * 3; ++i)
-		settings.sourceDelta[i] = current.pixels[i] - settings.srcimage.pixels[i];
 }
 
 void InterpolateColorHistogram(Settings& settings, const char* outputFileNameBase)
@@ -208,7 +239,7 @@ void InterpolateColorHistogram(Settings& settings, const char* outputFileNameBas
 	// Do interpolation
 	ImageData output = settings.srcimage;
 	for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
-		output.pixels[valueIndex] += settings.sourceDelta[valueIndex] * settings.weight;
+		output.pixels[valueIndex] = Lerp(settings.srcimage.pixels[valueIndex], settings.result[valueIndex], settings.weight);
 
 	// Save output image
 	SaveFloatImage(output, outputFileName);
@@ -218,18 +249,11 @@ int main(int argc, char** argv)
 {
 	_mkdir("out");
 
-	system("python MakeHistogram.py images/florida.png out/florida.histogram.png 12000");
-	system("python MakeHistogram.py images/bigcat.png out/bigcat.histogram.png 12000");
-	system("python MakeHistogram.py images/dunes.png out/dunes.histogram.png 12000");
-	system("python MakeHistogram.py images/turtle.png out/turtle.histogram.png 12000");
-
 	{
 		Settings settings;
 		settings.srcImageFileName = "images/florida.png";
 		settings.targetImageFileName = "images/dunes.png";
 		InterpolateColorHistogram(settings, "out/florida-dunes");
-
-		system("python MakeHistogram.py out/florida-dunes.png out/florida-dunes.histogram.png 12000");
 	}
 
 	{
@@ -237,8 +261,6 @@ int main(int argc, char** argv)
 		settings.srcImageFileName = "images/florida.png";
 		settings.targetImageFileName = "images/turtle.png";
 		InterpolateColorHistogram(settings, "out/florida-turtle");
-
-		system("python MakeHistogram.py out/florida-turtle.png out/florida-turtle.histogram.png 12000");
 	}
 
 	{
@@ -246,8 +268,6 @@ int main(int argc, char** argv)
 		settings.srcImageFileName = "images/florida.png";
 		settings.targetImageFileName = "images/bigcat.png";
 		InterpolateColorHistogram(settings, "out/florida-bigcat");
-
-		system("python MakeHistogram.py out/florida-bigcat.png out/florida-bigcat.histogram.png 12000");
 	}
 
 	return 0;
@@ -255,12 +275,14 @@ int main(int argc, char** argv)
 
 /*
 TODO:
+* get rid of settings struct, make this more ad hoc
 * make a csv of total movement over time and graph it to see if it's enough steps
 * output how long it took. not super important though
 * clean up code?
 * make an interpolation example with 2 images
-* move python calls into a batch file, instead of running python from c++
+* also with 3.
 ! mention in the post that you could do barycentric interpolation with multiple images. and could even go "outside of the simplex" with those coordinates to move away from histograms etc.
 ! mention that the sorting is the slowest part, per the profiler. same as the other post. could multithread it but :shrug:
 ! say how long it took, and what resolution image
+* mention how you can do all the batches in parallel
 */
