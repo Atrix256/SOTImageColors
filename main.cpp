@@ -86,6 +86,11 @@ void SlicedOptimalTransport(Settings& settings)
 
 	std::vector<uint32_t> currentSorted(c_numPixels);
 	std::vector<uint32_t> targetSorted(c_numPixels);
+	for (uint32_t i = 0; i < c_numPixels; ++i)
+	{
+		currentSorted[i] = i;
+		targetSorted[i] = i;
+	}
 
 	std::vector<float> currentProjections(c_numPixels);
 	std::vector<float> targetProjections(c_numPixels);
@@ -111,9 +116,6 @@ void SlicedOptimalTransport(Settings& settings)
 			// project current and target
 			for (size_t i = 0; i < c_numPixels; ++i)
 			{
-				currentSorted[i] = (uint32_t)i;
-				targetSorted[i] = (uint32_t)i;
-
 				currentProjections[i] =
 					direction[0] * current.pixels[i * 3 + 0] +
 					direction[1] * current.pixels[i * 3 + 1] +
@@ -156,14 +158,14 @@ void SlicedOptimalTransport(Settings& settings)
 		for (size_t i = 0; i < c_numPixels; ++i)
 		{
 			float adjust[3] = {
-				batchDirections[currentSorted[i] * 3 + 0] / float(c_batchSize),
-				batchDirections[currentSorted[i] * 3 + 1] / float(c_batchSize),
-				batchDirections[currentSorted[i] * 3 + 2] / float(c_batchSize)
+				batchDirections[i * 3 + 0] / float(c_batchSize),
+				batchDirections[i * 3 + 1] / float(c_batchSize),
+				batchDirections[i * 3 + 2] / float(c_batchSize)
 			};
 
-			current.pixels[currentSorted[i] * 3 + 0] += adjust[0];
-			current.pixels[currentSorted[i] * 3 + 1] += adjust[1];
-			current.pixels[currentSorted[i] * 3 + 2] += adjust[2];
+			current.pixels[i * 3 + 0] += adjust[0];
+			current.pixels[i * 3 + 1] += adjust[1];
+			current.pixels[i * 3 + 2] += adjust[2];
 
 			totalDistance += std::sqrt(adjust[0] * adjust[0] + adjust[1] * adjust[1] + adjust[2] * adjust[2]);
 		}
@@ -203,7 +205,7 @@ void InterpolateColorHistogram(Settings& settings, const char* outputFileNameBas
 	// do optimal transport to get the per pixel delta to get from the source image to the target image
 	SlicedOptimalTransport(settings);
 
-	// Do barycentric interpolation
+	// Do interpolation
 	ImageData output = settings.srcimage;
 	for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
 		output.pixels[valueIndex] += settings.sourceDelta[valueIndex] * settings.weight;
@@ -254,9 +256,11 @@ int main(int argc, char** argv)
 /*
 TODO:
 * make a csv of total movement over time and graph it to see if it's enough steps
-* output how long it took. not super important
+* output how long it took. not super important though
 * clean up code?
-* optimize code? omp?
 * make an interpolation example with 2 images
+* move python calls into a batch file, instead of running python from c++
 ! mention in the post that you could do barycentric interpolation with multiple images. and could even go "outside of the simplex" with those coordinates to move away from histograms etc.
+! mention that the sorting is the slowest part, per the profiler. same as the other post. could multithread it but :shrug:
+! say how long it took, and what resolution image
 */
