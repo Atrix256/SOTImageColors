@@ -15,26 +15,13 @@ static const int c_batchSize = 16;
 #include <vector>
 #include <direct.h>
 #include <stdio.h>
-
-using Vec3 = float[3];
+#include <chrono>
 
 struct ImageData
 {
 	int width = 0;
 	int height = 0;
 	std::vector<float> pixels;
-};
-
-struct Settings
-{
-	const char* srcImageFileName = nullptr;
-	ImageData srcimage;
-
-	const char* targetImageFileName = nullptr;
-	ImageData targetImage;
-	float weight = 1.0f;
-
-	std::vector<float> result;
 };
 
 inline float Lerp(float A, float B, float t)
@@ -53,7 +40,7 @@ std::mt19937 GetRNG(int index)
 	return ret;
 }
 
-bool LoadImageAsFloat(const char* fileName, ImageData& imageData)
+bool LoadImageAsFloat(ImageData& imageData, const char* fileName)
 {
 	int c;
 	stbi_uc* pixelsU8 = stbi_load(fileName, &imageData.width, &imageData.height, &c, 3);
@@ -78,14 +65,21 @@ bool SaveFloatImage(const ImageData& imageData, const char* fileName)
 	return stbi_write_png(fileName, imageData.width, imageData.height, 3, pixels.data(), 0) == 1;
 }
 
-void SlicedOptimalTransport(Settings& settings)
+void SlicedOptimalTransport(const ImageData& srcImage, const ImageData& targetImage, std::vector<float>& results, const char* outputFileNameCSV)
 {
-	printf("\n%s\n\n", settings.targetImageFileName);
+	std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
 
-	const uint32_t c_numPixels = settings.srcimage.width * settings.srcimage.height;
+	printf("==================================\nCalculating Optimal Transport - %s\n==================================\n", outputFileNameCSV);
 
-	std::vector<float>& current = settings.result;
-	current = settings.srcimage.pixels;
+	FILE* file = nullptr;
+	fopen_s(&file, outputFileNameCSV, "wb");
+	fprintf(file, "\"Iteration\",\"Avg. Movement\"\n");
+
+	const uint32_t c_numPixels = srcImage.width * srcImage.height;
+
+	// start the results at the starting point - the source image
+	results = srcImage.pixels;
+	std::vector<float>& current = results; // current is an alias of results, to make the code make more sense
 
 	// Per batch data
 	// Each batch has it's own data so the batches can be parallelized
@@ -130,7 +124,7 @@ void SlicedOptimalTransport(Settings& settings)
 			std::normal_distribution<float> normalDist(0.0f, 1.0f);
 
 			// Make a uniform random unit vector by generating 3 normal distributed values and normalizing the result.
-			Vec3 direction;
+			float direction[3];
 			direction[0] = normalDist(rng);
 			direction[1] = normalDist(rng);
 			direction[2] = normalDist(rng);
@@ -148,9 +142,9 @@ void SlicedOptimalTransport(Settings& settings)
 					direction[2] * current[i * 3 + 2];
 
 				batchData.targetProjections[i] =
-					direction[0] * settings.targetImage.pixels[i * 3 + 0] +
-					direction[1] * settings.targetImage.pixels[i * 3 + 1] +
-					direction[2] * settings.targetImage.pixels[i * 3 + 2];
+					direction[0] * targetImage.pixels[i * 3 + 0] +
+					direction[1] * targetImage.pixels[i * 3 + 1] +
+					direction[2] * targetImage.pixels[i * 3 + 2];
 			}
 
 			// sort current and target
@@ -207,39 +201,41 @@ void SlicedOptimalTransport(Settings& settings)
 		}
 
 		printf("[%i] %f\n", iteration, totalDistance / float(c_numPixels));
+		fprintf(file, "\"%i\",\"%f\"\n", iteration, totalDistance / float(c_numPixels));
 	}
+
+	fclose(file);
+
+	float elpasedSeconds = std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::high_resolution_clock::now() - start).count();
+	printf("\n%0.2f seconds\n\n", elpasedSeconds);	
 }
 
-void InterpolateColorHistogram(Settings& settings, const char* outputFileNameBase)
+void InterpolateColorHistogram1D(const ImageData& srcImage, const std::vector<float>& target, float weight, const char* outputFileName)
 {
-	char outputFileName[1024];
-	sprintf_s(outputFileName, "%s.png", outputFileNameBase);
-
-	char outputFileNameCSV[1024];
-	sprintf_s(outputFileNameCSV, "%s.csv", outputFileNameBase);
-
-	printf("==================================\n%s\n==================================\n", outputFileName);
-
-	// load up the source image
-	LoadImageAsFloat(settings.srcImageFileName, settings.srcimage);
-
-	// load the target image and verify it's compatible
-	LoadImageAsFloat(settings.targetImageFileName, settings.targetImage);
-	if (settings.targetImage.width != settings.srcimage.width || settings.targetImage.height != settings.srcimage.height)
-	{
-		printf("ERROR: image %s is %ix%i, but should be %ix%i like %s.\n",
-			settings.targetImageFileName, settings.targetImage.width, settings.targetImage.height,
-			settings.srcimage.width, settings.srcimage.height, settings.srcImageFileName);
-		return;
-	}
-
-	// do optimal transport to get the per pixel delta to get from the source image to the target image
-	SlicedOptimalTransport(settings);
+	// 1D barycentric coordinates. They add up to 1.0.
+	float u = 1.0f - weight;
+	float v = weight;
 
 	// Do interpolation
-	ImageData output = settings.srcimage;
+	ImageData output = srcImage;
 	for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
-		output.pixels[valueIndex] = Lerp(settings.srcimage.pixels[valueIndex], settings.result[valueIndex], settings.weight);
+		output.pixels[valueIndex] = srcImage.pixels[valueIndex] * u + target[valueIndex] * v;
+
+	// Save output image
+	SaveFloatImage(output, outputFileName);
+}
+
+void InterpolateColorHistogram2D(const ImageData& srcImage, const std::vector<float>& target1, float weight1, const std::vector<float>& target2, float weight2, const char* outputFileName)
+{
+	// 2D barycentric coordinates. They add up to 1.0.
+	float u = 1.0f - (weight1 + weight2);
+	float v = weight1;
+	float w = weight2;
+
+	// Do interpolation
+	ImageData output = srcImage;
+	for (size_t valueIndex = 0; valueIndex < output.width * output.height * 3; ++valueIndex)
+		output.pixels[valueIndex] = srcImage.pixels[valueIndex] * u + target1[valueIndex] * v + target2[valueIndex] * w;
 
 	// Save output image
 	SaveFloatImage(output, outputFileName);
@@ -249,40 +245,79 @@ int main(int argc, char** argv)
 {
 	_mkdir("out");
 
+	// Load the images
+	ImageData srcImage;
+	if (!LoadImageAsFloat(srcImage, "images/florida.png"))
 	{
-		Settings settings;
-		settings.srcImageFileName = "images/florida.png";
-		settings.targetImageFileName = "images/dunes.png";
-		InterpolateColorHistogram(settings, "out/florida-dunes");
+		printf("could not load images/florida.png");
+		return 1;
 	}
 
+	ImageData imageDunes;
+	if (!LoadImageAsFloat(imageDunes, "images/dunes.png"))
 	{
-		Settings settings;
-		settings.srcImageFileName = "images/florida.png";
-		settings.targetImageFileName = "images/turtle.png";
-		InterpolateColorHistogram(settings, "out/florida-turtle");
+		printf("could not load images/dunes.png");
+		return 1;
 	}
 
+	ImageData imageTurtle;
+	if (!LoadImageAsFloat(imageTurtle, "images/turtle.png"))
 	{
-		Settings settings;
-		settings.srcImageFileName = "images/florida.png";
-		settings.targetImageFileName = "images/bigcat.png";
-		InterpolateColorHistogram(settings, "out/florida-bigcat");
+		printf("could not load images/turtle.png");
+		return 1;
 	}
+
+	ImageData imageBigCat;
+	if (!LoadImageAsFloat(imageBigCat, "images/bigcat.png"))
+	{
+		printf("could not load images/bigcat.png");
+		return 1;
+	}
+
+	// Calculate optimal transport from the source image to the other images
+	std::vector<float> OTDunes;
+	SlicedOptimalTransport(srcImage, imageDunes, OTDunes, "out/dunes.csv");
+
+	std::vector<float> OTTurtle;
+	SlicedOptimalTransport(srcImage, imageTurtle, OTTurtle, "out/turtle.csv");
+
+	std::vector<float> OTBigCat;
+	SlicedOptimalTransport(srcImage, imageBigCat, OTBigCat, "out/bigcat.csv");
+
+	// Make results
+	InterpolateColorHistogram1D(srcImage, OTDunes, 1.0f, "out/florida-dunes.png");
+	InterpolateColorHistogram1D(srcImage, OTTurtle, 1.0f, "out/florida-turtle.png");
+	InterpolateColorHistogram1D(srcImage, OTBigCat, 1.0f, "out/florida-bigcat.png");
+
+	// Do 1d barycentric interpolation towards bigcat
+	for (int i = 0; i < 3; ++i)
+	{
+		float alpha = float(i + 1) / 4;
+		int percent = int(alpha * 100.0f);
+		char fileName[1024];
+		sprintf_s(fileName, "out/florida-bigcat_%i.png", percent);
+		InterpolateColorHistogram1D(srcImage, OTBigCat, alpha, fileName);
+	}
+
+	// Do 2d barycentric interpolation towards turtle and dunes
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.0f, OTDunes, 0.33f, "out/florida-turtle_0_dunes_33.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.0f, OTDunes, 0.66f, "out/florida-turtle_0_dunes_66.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.33f, OTDunes, 0.0f, "out/florida-turtle_33_dunes_0.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.66f, OTDunes, 0.0f, "out/florida-turtle_66_dunes_0.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.33f, OTDunes, 0.66f, "out/florida-turtle_33_dunes_66.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.66f, OTDunes, 0.33f, "out/florida-turtle_66_dunes_33.png");
+	InterpolateColorHistogram2D(srcImage, OTTurtle, 0.33f, OTDunes, 0.33f, "out/florida-turtle_33_dunes_33.png");
 
 	return 0;
 }
 
 /*
 TODO:
-* get rid of settings struct, make this more ad hoc
-* make a csv of total movement over time and graph it to see if it's enough steps
-* output how long it took. not super important though
-* clean up code?
-* make an interpolation example with 2 images
-* also with 3.
+! 300 lines of C++ code, and just stb for image reading and writing.
 ! mention in the post that you could do barycentric interpolation with multiple images. and could even go "outside of the simplex" with those coordinates to move away from histograms etc.
 ! mention that the sorting is the slowest part, per the profiler. same as the other post. could multithread it but :shrug:
 ! say how long it took, and what resolution image
+! show graphs of csvs
 * mention how you can do all the batches in parallel
+* ! show example of 1d and 2d interpolation. both the images and the histograms
 */
